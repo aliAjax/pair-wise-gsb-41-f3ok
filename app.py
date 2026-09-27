@@ -23,6 +23,8 @@ TRANSITIONS = {
     "review": {"approved", "rejected", "escalated"},
     "escalated": {"assigned", "review", "rejected"},
 }
+RECOVERY_METHODS = {"salvage", "subrogation", "other"}
+REOPENABLE = {"approved", "rejected", "closed"}
 
 
 class DomainError(Exception):
@@ -137,6 +139,20 @@ class CatastropheClaimService:
                     reference TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS recoveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    method TEXT NOT NULL,
+                    expected_amount REAL NOT NULL,
+                    received_amount REAL,
+                    voucher TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    received_by TEXT,
+                    received_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     claim_id INTEGER REFERENCES claims(id),
@@ -147,6 +163,7 @@ class CatastropheClaimService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_claims_queue ON claims(status, priority_score DESC, created_at);
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
+                CREATE INDEX IF NOT EXISTS idx_recoveries_claim ON recoveries(claim_id,status);
                 """
             )
 
@@ -161,6 +178,19 @@ class CatastropheClaimService:
         if not row:
             raise DomainError("理赔案件不存在", 404)
         return row
+
+    def _recovery(self, conn: sqlite3.Connection, recovery_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM recoveries WHERE id=?", (recovery_id,)).fetchone()
+        if not row:
+            raise DomainError("回收记录不存在", 404)
+        return row
+
+    def _received_total(self, conn: sqlite3.Connection, claim_id: int) -> float:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(received_amount),0) AS s FROM recoveries WHERE claim_id=? AND status='received'",
+            (claim_id,),
+        ).fetchone()
+        return float(row["s"])
 
     def create_claim(self, actor: str, role: str, claim_no: str, event_id: str,
                      region: str, peril_type: str, policy_no: str, claimant_ref: str,
@@ -399,6 +429,8 @@ class CatastropheClaimService:
                 raise DomainError("高风险案件未解除风险标记，不能赔付", 409)
             if decision == "approve" and payout > claim["estimated_loss"]:
                 raise DomainError("核定金额不能超过预估损失", 409)
+            if decision == "approve" and self._received_total(conn, claim_id) > payout + 1e-6:
+                raise DomainError("已回收金额超过核定赔款，请先调整回收台账", 409)
             if decision == "reject" and not reason.strip():
                 raise DomainError("拒赔必须填写理由", 409)
             status = "approved" if decision == "approve" else "rejected"
@@ -408,6 +440,116 @@ class CatastropheClaimService:
             )
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
             return dict(self._claim(conn, claim_id))
+
+    def register_recovery(self, actor: str, role: str, claim_id: int, method: str,
+                          expected_amount: float, voucher: str, note: str = "") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "登记赔后回收")
+        method = (method or "").strip()
+        if method not in RECOVERY_METHODS:
+            raise DomainError("处置方式无效，应为 salvage/subrogation/other")
+        voucher = (voucher or "").strip()
+        if not voucher:
+            raise DomainError("收款凭证号不能为空")
+        try:
+            expected_amount = float(expected_amount)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("预计回收金额必须是数值") from exc
+        if expected_amount <= 0:
+            raise DomainError("预计回收金额必须大于0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] == "duplicate":
+                raise DomainError("重复报案不能登记回收", 409)
+            try:
+                cur = conn.execute(
+                    "INSERT INTO recoveries(claim_id,method,expected_amount,voucher,note,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (claim_id, method, expected_amount, voucher, (note or "").strip(), actor, utcnow()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("同一凭证不能重复入账", 409) from exc
+            self._audit(conn, claim_id, actor, "recovery.registered",
+                        {"recovery_id": cur.lastrowid, "method": method, "expected_amount": expected_amount, "voucher": voucher})
+            return dict(self._recovery(conn, cur.lastrowid))
+
+    def confirm_recovery(self, actor: str, role: str, recovery_id: int, received_amount: float) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "确认回收到账")
+        try:
+            received_amount = float(received_amount)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("到账金额必须是数值") from exc
+        if received_amount <= 0:
+            raise DomainError("到账金额必须大于0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            entry = self._recovery(conn, recovery_id)
+            if entry["status"] != "pending":
+                raise DomainError("该回收已到账，不能重复入账", 409)
+            claim = self._claim(conn, entry["claim_id"])
+            if claim["status"] != "approved":
+                raise DomainError("案件尚未核定，回收留在待处理", 409)
+            payout = claim["final_payout"] or 0.0
+            if self._received_total(conn, claim["id"]) + received_amount > payout + 1e-6:
+                raise DomainError("回收超过核定赔款，留在待处理", 409)
+            conn.execute(
+                "UPDATE recoveries SET status='received',received_amount=?,received_by=?,received_at=? WHERE id=?",
+                (received_amount, actor, utcnow(), recovery_id),
+            )
+            self._audit(conn, claim["id"], actor, "recovery.received",
+                        {"recovery_id": recovery_id, "received_amount": received_amount, "voucher": entry["voucher"]})
+            return dict(self._recovery(conn, recovery_id))
+
+    def reopen_claim(self, actor: str, role: str, claim_id: int, expected_version: int, reason: str = "") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "重开案件")
+        if not (reason or "").strip():
+            raise DomainError("重开必须填写理由")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] not in REOPENABLE:
+                raise DomainError("只有已结案案件可以重开", 409)
+            if claim["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            conn.execute(
+                "UPDATE claims SET status='review',version=version+1,updated_at=? WHERE id=? AND version=?",
+                (utcnow(), claim_id, expected_version),
+            )
+            self._audit(conn, claim_id, actor, "claim.reopened", {"from": claim["status"], "reason": reason.strip()})
+            return dict(self._claim(conn, claim_id))
+
+    def recovery_ledger(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
+        if role not in {"supervisor", "auditor"}:
+            raise DomainError("角色无权查看回收台账", 403)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT c.id AS claim_id, c.claim_no, c.status, c.region, c.event_id, c.version,
+                          COALESCE(c.final_payout,0) AS payout,
+                          COALESCE(SUM(CASE WHEN r.status='pending' THEN r.expected_amount END),0) AS pending,
+                          COALESCE(SUM(CASE WHEN r.status='received' THEN r.received_amount END),0) AS received,
+                          COUNT(r.id) AS entry_count
+                   FROM claims c LEFT JOIN recoveries r ON r.claim_id=c.id
+                   WHERE c.status<>'duplicate'
+                   GROUP BY c.id
+                   HAVING payout>0 OR entry_count>0
+                   ORDER BY c.id DESC"""
+            ).fetchall()
+            entries = [dict(r) for r in conn.execute("SELECT * FROM recoveries ORDER BY id").fetchall()]
+        by_claim: dict[int, list[dict[str, Any]]] = {}
+        for entry in entries:
+            by_claim.setdefault(entry["claim_id"], []).append(entry)
+        ledger = []
+        for row in rows:
+            item = dict(row)
+            item.pop("entry_count")
+            for key in ("payout", "pending", "received"):
+                item[key] = round(item[key], 2)
+            item["net"] = round(item["payout"] - item["pending"] - item["received"], 2)
+            item["entries"] = by_claim.get(item["claim_id"], [])
+            ledger.append(item)
+        return {"ledger": ledger}
 
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
         if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
@@ -498,6 +640,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/recoveries":
+                actor, role = self._headers()
+                self._send(200, self.service.recovery_ledger(actor, role))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -522,6 +667,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/claims/reopen":
+                result = self.service.reopen_claim(actor, role, **data)
+            elif path == "/api/recoveries":
+                result = self.service.register_recovery(actor, role, **data)
+            elif path == "/api/recoveries/receive":
+                result = self.service.confirm_recovery(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

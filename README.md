@@ -25,6 +25,10 @@ python3 app.py
 - `POST /api/claims/survey`、`POST /api/claims/submit-review`
 - `POST /api/claims/emergency-advance`：仅限监督人员、紧急且未超20%的案件
 - `POST /api/claims/finalize`：锁定最终核定结果
+- `POST /api/recoveries`：主管登记赔后回收（处置方式 salvage/subrogation/other、预计回收、收款凭证），预计金额先抵减净损失
+- `POST /api/recoveries/receive`：确认到账后计入已回收；同一凭证不能重复入账，回收超过赔款或案件尚未核定时留在待处理
+- `POST /api/claims/reopen`：重开已结案案件（approved/rejected/closed → review），回收台账保留可继续追
+- `GET /api/recoveries`：赔后回收台账，按案件显示赔款、待回收、已回收和净支出（supervisor/auditor 可见）
 
 ## 测试
 
@@ -32,7 +36,7 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整赔付流程、重复报案、乐观锁冲突、批量伪证识别和角色权限。
+测试覆盖完整赔付流程、重复报案、乐观锁冲突、批量伪证识别、角色权限，以及赔后回收台账（登记抵减、到账确认、凭证去重、超额/未核定留待处理、重开续追）。
 
 ## 局限
 
