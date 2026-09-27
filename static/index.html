@@ -1,6 +1,157 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
-<h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>巨灾理赔调度 · 赔后回收台账</title>
+<style>
+  body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}
+  table{border-collapse:collapse;width:100%;margin:10px 0}
+  th,td{border:1px solid #d3dce3;padding:6px 8px;font-size:14px}
+  th{background:#f1f5f7;text-align:left}
+  .card{background:#fff8eb;border-left:5px solid #d58b21;padding:10px 16px;margin:12px 0}
+  .claim{border:1px solid #d3dce3;border-radius:6px;padding:12px 16px;margin:14px 0}
+  .claim h3{margin:0 0 4px}
+  .metrics{display:flex;gap:18px;flex-wrap:wrap;margin:8px 0;font-weight:600}
+  .metrics span{background:#eef2f4;border-radius:4px;padding:2px 10px}
+  .net{background:#e6f2e6!important}
+  .pending-tag{color:#b35c00}
+  .received-tag{color:#1d7a32}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  input,select,button{font:inherit;padding:4px 8px}
+  button{cursor:pointer}
+  button.primary{background:#205081;color:#fff;border:none;border-radius:4px;padding:5px 14px}
+  code{background:#eef2f4;padding:2px 5px}
+  .msg{margin:8px 0;padding:8px 12px;border-radius:4px;display:none}
+  .msg.err{background:#fbe4e4;color:#8a1f1f;display:block}
+  .msg.ok{background:#e3f3e5;color:#1d5a2a;display:block}
+  form.inline{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+  form.inline input{width:120px}
+  .muted{color:#74828c;font-size:13px}
+</style>
+<h1>巨灾保险理赔调度</h1>
+<div class="card">
+  写入接口需要 <code>X-User</code>、<code>X-Role</code> 请求头。回收台账仅 <code>supervisor</code> 可登记与确认；
+  预计回收登记即抵减净损失，正式到账后才计入已回收；同一收款凭证不能重复入账。
+</div>
+<div class="toolbar">
+  <label>操作人 <input id="user" value="sup1"></label>
+  <label>角色
+    <select id="role">
+      <option value="supervisor" selected>supervisor 主管</option>
+      <option value="intake">intake 受理</option>
+      <option value="adjuster">adjuster 理算</option>
+      <option value="surveyor">surveyor 查勘</option>
+      <option value="auditor">auditor 审计</option>
+      <option value="viewer">viewer 访客</option>
+    </select>
+  </label>
+  <button class="primary" onclick="load()">刷新</button>
+  <span id="msg" class="msg"></span>
+</div>
+
+<h2>赔后回收台账（按案件）</h2>
+<div id="ledger"><p class="muted">加载中…</p></div>
+
+<h2>优先队列</h2>
+<table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+
+<h2>最近时间线</h2>
+<ol id="timeline"></ol>
+
+<script>
+const $ = s => document.querySelector(s);
+function money(v){ return Number(v||0).toFixed(2); }
+const METHODS = [['salvage','残值处置'],['subrogation','第三方追偿'],['other','其他回收']];
+const STATUS = {received:'<span class="received-tag">已回收</span>', pending:'<span class="pending-tag">待回收</span>'};
+
+function show(text, ok){
+  const el = $('#msg');
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+}
+
+async function api(path, body){
+  const res = await fetch(path, {
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-User':$('#user').value.trim(),'X-Role':$('#role').value},
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error || ('请求失败 '+res.status));
+  return data;
+}
+
+async function act(path, body){
+  try{ await api(path, body); show('操作成功', true); }
+  catch(e){ show(e.message, false); }
+  await load();
+}
+
+async function load(){
+  const opts = {headers:{'X-User':$('#user').value.trim(),'X-Role':$('#role').value}};
+  const d = await fetch('/api/state', opts).then(r=>r.json());
+  if(d.access_limited){
+    $('#ledger').innerHTML = '<p class="muted">当前角色无权查看回收台账。</p>';
+    $('#claims tbody').innerHTML = '';
+    $('#timeline').innerHTML = '';
+    return;
+  }
+  $('#claims tbody').innerHTML = d.claims.map(r=>
+    `<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`
+  ).join('');
+  $('#timeline').innerHTML = d.timeline.slice(0,20).map(x=>
+    `<li>${x.created_at} ${x.action} ${x.details}</li>`
+  ).join('');
+
+  const ledger = await fetch('/api/recoveries', opts).then(r=>r.json());
+  if(ledger.error){ $('#ledger').innerHTML = '<p class="muted">'+ledger.error+'</p>'; return; }
+  const writable = $('#role').value === 'supervisor';
+  $('#ledger').innerHTML = ledger.claims.map(c=>{
+    const rows = c.recoveries.length ? c.recoveries.map(r=>{
+      let action;
+      if(r.status === 'pending' && writable){
+        action = `<form class="inline" onsubmit="act('/api/recoveries/confirm',{recovery_id:${r.id},voucher_no:this.voucher.value,received_amount:this.amt.value===''?null:Number(this.amt.value)});return false;">
+          <input name="voucher" placeholder="收款凭证号" required>
+          <input name="amt" type="number" step="0.01" placeholder="到账金额(可空)">
+          <button>确认到账</button></form>`;
+      } else if(r.status === 'received') {
+        action = `<span class="muted">凭证 ${r.voucher_no}</span>`;
+      } else action = '';
+      return `<tr>
+        <td>${r.method_label}</td>
+        <td>${money(r.expected_amount)}</td>
+        <td>${r.status==='received' ? money(r.received_amount) : '—'}</td>
+        <td>${STATUS[r.status]}</td>
+        <td>${action}</td>
+        <td class="muted">${r.note||''}</td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="6" class="muted">暂无回收登记</td></tr>';
+    const payoutText = c.approved ? money(c.payout) : '尚未核定';
+    const register = writable && !['duplicate','rejected','closed'].includes(c.status) ? `
+      <form class="inline" onsubmit="act('/api/recoveries',{claim_id:${c.claim_id},method:this.method.value,expected_amount:Number(this.amt.value),note:this.note.value});return false;">
+        <select name="method">${METHODS.map(m=>`<option value="${m[0]}">${m[1]}</option>`).join('')}</select>
+        <input name="amt" type="number" step="0.01" placeholder="预计回收金额" required>
+        <input name="note" placeholder="处置说明(可空)">
+        <button>登记回收</button></form>` : '';
+    let lifecycle = '';
+    if(writable && c.status === 'approved'){
+      lifecycle = `<button onclick="act('/api/claims/close',{claim_id:${c.claim_id},expected_version:${c.version}})">结案</button>`;
+    } else if(writable && c.status === 'closed'){
+      lifecycle = `<button onclick="act('/api/claims/reopen',{claim_id:${c.claim_id},expected_version:${c.version},reason:'继续追偿'})">重开继续追</button>`;
+    }
+    return `<div class="claim">
+      <h3>${c.claim_no} <span class="muted">[${c.status}]</span></h3>
+      <div class="metrics">
+        <span>核定赔款：${payoutText}</span>
+        <span class="pending-tag">待回收：${money(c.pending_recovery)}</span>
+        <span class="received-tag">已回收：${money(c.recovered)}</span>
+        <span class="net">净支出：${money(c.net_outlay)}</span>
+      </div>
+      <table><thead><tr><th>处置方式</th><th>预计回收</th><th>实际到账</th><th>状态</th><th>收款凭证 / 操作</th><th>说明</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">${register}${lifecycle}</div>
+    </div>`;
+  }).join('');
+}
+load();
+</script>
+</html>

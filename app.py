@@ -15,6 +15,12 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
 TERMINAL = {"duplicate", "approved", "rejected", "closed"}
+RECOVERY_METHODS = {"salvage", "subrogation", "other"}
+RECOVERY_METHOD_LABELS = {
+    "salvage": "残值处置",
+    "subrogation": "第三方追偿",
+    "other": "其他回收",
+}
 TRANSITIONS = {
     "received": {"triaged"},
     "triaged": {"assigned", "escalated"},
@@ -137,6 +143,20 @@ class CatastropheClaimService:
                     reference TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS recoveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    method TEXT NOT NULL,
+                    expected_amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    voucher_no TEXT UNIQUE,
+                    received_amount REAL,
+                    registered_by TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    received_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     claim_id INTEGER REFERENCES claims(id),
@@ -147,6 +167,7 @@ class CatastropheClaimService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_claims_queue ON claims(status, priority_score DESC, created_at);
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
+                CREATE INDEX IF NOT EXISTS idx_recoveries_claim ON recoveries(claim_id, status);
                 """
             )
 
@@ -409,6 +430,159 @@ class CatastropheClaimService:
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
             return dict(self._claim(conn, claim_id))
 
+    def register_recovery(self, actor: str, role: str, claim_id: int, method: str,
+                          expected_amount: float, note: str = "") -> dict[str, Any]:
+        """主管登记赔后回收处置（残值/追偿）。登记即按预计金额抵减净损失，到账前留在待回收。"""
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "登记赔后回收")
+        method = (method or "").strip()
+        if method not in RECOVERY_METHODS:
+            raise DomainError("处置方式无效，应为残值处置、第三方追偿或其他回收")
+        try:
+            expected_amount = float(expected_amount)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("预计回收金额必须是数值") from exc
+        if expected_amount <= 0:
+            raise DomainError("预计回收金额必须大于0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] in {"duplicate", "rejected"}:
+                raise DomainError("重复报案或拒赔案件不能登记回收", 409)
+            if claim["status"] == "closed":
+                raise DomainError("已结案回收须先重开案件才能继续追", 409)
+            cur = conn.execute(
+                """INSERT INTO recoveries(claim_id,method,expected_amount,status,registered_by,note,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (claim_id, method, expected_amount, "pending", actor, note.strip(), utcnow()),
+            )
+            rid = cur.lastrowid
+            self._audit(conn, claim_id, actor, "recovery.registered",
+                        {"recovery_id": rid, "method": method, "expected_amount": expected_amount})
+            return dict(conn.execute("SELECT * FROM recoveries WHERE id=?", (rid,)).fetchone())
+
+    def confirm_recovery(self, actor: str, role: str, recovery_id: int, voucher_no: str,
+                         received_amount: float | None = None) -> dict[str, Any]:
+        """凭收款凭证确认正式到账。案件未核定、累计回收超过赔款时留在待处理；同一凭证不能重复入账。"""
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "确认回收到账")
+        voucher_no = (voucher_no or "").strip()
+        if not voucher_no:
+            raise DomainError("收款凭证号不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM recoveries WHERE id=?", (recovery_id,)).fetchone()
+            if not row:
+                raise DomainError("回收记录不存在", 404)
+            if row["status"] != "pending":
+                raise DomainError("该回收已确认到账，不能重复入账", 409)
+            claim = self._claim(conn, row["claim_id"])
+            if claim["status"] not in {"approved", "closed"} or claim["final_payout"] is None:
+                raise DomainError("案件尚未核定赔付，回收款留在待处理", 409)
+            if claim["status"] == "closed":
+                raise DomainError("案件已结案，须先重开才能确认到账", 409)
+            amount = row["expected_amount"] if received_amount is None else float(received_amount)
+            if amount <= 0:
+                raise DomainError("到账金额必须大于0")
+            already = conn.execute(
+                "SELECT COALESCE(SUM(received_amount),0) AS s FROM recoveries WHERE claim_id=? AND status='received'",
+                (claim["id"],),
+            ).fetchone()["s"]
+            if already + amount > claim["final_payout"] + 1e-6:
+                raise DomainError("累计回收超过核定赔款，超过部分留在待处理", 409)
+            try:
+                conn.execute(
+                    """UPDATE recoveries SET status='received',voucher_no=?,received_amount=?,confirmed_by=?,received_at=?
+                       WHERE id=? AND status='pending'""",
+                    (voucher_no, amount, actor, utcnow(), recovery_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("收款凭证已入账，同一凭证不能重复使用", 409) from exc
+            self._audit(conn, claim["id"], actor, "recovery.confirmed",
+                        {"recovery_id": recovery_id, "voucher_no": voucher_no, "received_amount": amount})
+            return dict(conn.execute("SELECT * FROM recoveries WHERE id=?", (recovery_id,)).fetchone())
+
+    def close_claim(self, actor: str, role: str, claim_id: int, expected_version: int) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "案件结案")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] != "approved":
+                raise DomainError("只有已核定赔付的案件可以结案", 409)
+            if claim["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            pending = conn.execute(
+                "SELECT COUNT(*) AS c FROM recoveries WHERE claim_id=? AND status='pending'", (claim_id,)
+            ).fetchone()["c"]
+            if pending:
+                raise DomainError("尚有 %d 笔待回收款，不能结案" % pending, 409)
+            conn.execute(
+                "UPDATE claims SET status='closed',version=version+1,updated_at=? WHERE id=? AND version=?",
+                (utcnow(), claim_id, expected_version),
+            )
+            self._audit(conn, claim_id, actor, "claim.closed", {})
+            return dict(self._claim(conn, claim_id))
+
+    def reopen_claim(self, actor: str, role: str, claim_id: int, expected_version: int,
+                     reason: str = "") -> dict[str, Any]:
+        """重开已结案件，回到已核定状态继续追偿。"""
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "重开案件")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] != "closed":
+                raise DomainError("只有已结案案件可以重开", 409)
+            if claim["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            conn.execute(
+                "UPDATE claims SET status='approved',version=version+1,updated_at=? WHERE id=? AND version=?",
+                (utcnow(), claim_id, expected_version),
+            )
+            self._audit(conn, claim_id, actor, "claim.reopened", {"reason": reason.strip()})
+            return dict(self._claim(conn, claim_id))
+
+    def recovery_ledger(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
+        """按案件汇总赔款、待回收、已回收和净支出。"""
+        if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
+            raise DomainError("角色无权查看回收台账", 403)
+        with self.connect() as conn:
+            if role in {"adjuster", "surveyor"}:
+                claims = conn.execute(
+                    "SELECT * FROM claims WHERE assignee=? OR surveyor=? ORDER BY id DESC", (actor, actor)
+                ).fetchall()
+            else:
+                claims = conn.execute("SELECT * FROM claims ORDER BY id DESC").fetchall()
+            records = [dict(r) for r in conn.execute(
+                """SELECT r.*, c.claim_no, c.status AS claim_status, c.final_payout
+                   FROM recoveries r JOIN claims c ON c.id=r.claim_id ORDER BY r.id DESC"""
+            ).fetchall()]
+            for r in records:
+                r["method_label"] = RECOVERY_METHOD_LABELS.get(r["method"], r["method"])
+        by_claim: dict[int, list[dict[str, Any]]] = {}
+        for r in records:
+            by_claim.setdefault(r["claim_id"], []).append(r)
+        summary = []
+        for c in claims:
+            payout = c["final_payout"] or 0.0
+            items = by_claim.get(c["id"], [])
+            pending = sum(r["expected_amount"] for r in items if r["status"] == "pending")
+            recovered = sum(r["received_amount"] or 0 for r in items if r["status"] == "received")
+            summary.append({
+                "claim_id": c["id"],
+                "claim_no": c["claim_no"],
+                "status": c["status"],
+                "version": c["version"],
+                "approved": c["status"] in {"approved", "closed"},
+                "payout": round(payout, 2),
+                "pending_recovery": round(pending, 2),
+                "recovered": round(recovered, 2),
+                "net_outlay": round(payout - pending - recovered, 2),
+                "recoveries": items,
+            })
+        return {"claims": summary, "recoveries": records}
+
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
         if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
             raise DomainError("角色无权查看理赔队列", 403)
@@ -425,7 +599,7 @@ class CatastropheClaimService:
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         allowed = role in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}
         if not allowed:
-            return {"claims": [], "evidence": [], "payments": [], "timeline": [], "access_limited": True}
+            return {"claims": [], "evidence": [], "payments": [], "recoveries": [], "timeline": [], "access_limited": True}
         with self.connect() as conn:
             if role in {"adjuster", "surveyor"}:
                 claims = [dict(r) for r in conn.execute(
@@ -438,10 +612,11 @@ class CatastropheClaimService:
                 marks = ",".join("?" for _ in ids)
                 evidence = [dict(r) for r in conn.execute("SELECT * FROM evidence WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 payments = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
+                recoveries = [dict(r) for r in conn.execute("SELECT * FROM recoveries WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE claim_id IN (%s) ORDER BY id DESC LIMIT 300" % marks, ids).fetchall()]
             else:
-                evidence, payments, timeline = [], [], []
-        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline, "access_limited": False}
+                evidence, payments, recoveries, timeline = [], [], [], []
+        return {"claims": claims, "evidence": evidence, "payments": payments, "recoveries": recoveries, "timeline": timeline, "access_limited": False}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -498,6 +673,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/recoveries":
+                self._send(200, self.service.recovery_ledger(*self._headers()))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -522,6 +699,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/recoveries":
+                result = self.service.register_recovery(actor, role, **data)
+            elif path == "/api/recoveries/confirm":
+                result = self.service.confirm_recovery(actor, role, **data)
+            elif path == "/api/claims/close":
+                result = self.service.close_claim(actor, role, **data)
+            elif path == "/api/claims/reopen":
+                result = self.service.reopen_claim(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

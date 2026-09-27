@@ -26,6 +26,18 @@ python3 app.py
 - `POST /api/claims/emergency-advance`：仅限监督人员、紧急且未超20%的案件
 - `POST /api/claims/finalize`：锁定最终核定结果
 
+## 赔后回收台账
+
+核定赔付后的残值处置和第三方追偿不再走表外，由 `supervisor` 登记回收记录：
+
+- `POST /api/recoveries`：登记处置方式（`salvage` 残值处置 / `subrogation` 第三方追偿 / `other` 其他回收）、预计回收金额和说明。登记后预计金额即抵减净损失，状态为待回收（`pending`）。
+- `POST /api/recoveries/confirm`：凭收款凭证号确认正式到账，可按实际到账金额（缺省取预计金额）入账。案件尚未核定赔付、或累计回收超过核定赔款时拒绝入账并留在待处理；收款凭证号全局唯一，同一凭证不能重复入账。
+- `POST /api/claims/close` / `POST /api/claims/reopen`：有待回收款的案件不能结案；已结案件可重开继续追偿，重开后回到已核定状态。
+- `GET /api/recoveries`：按案件汇总核定赔款、待回收、已回收和净支出（赔款 − 待回收 − 已回收），并列出每笔回收明细。
+
+`GET /api/state` 同步返回 `recoveries` 记录；回收登记与确认写入 `timeline` 审计。
+
+
 ## 测试
 
 ```bash
